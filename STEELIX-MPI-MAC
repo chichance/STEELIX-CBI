@@ -1,0 +1,516 @@
+#!/bin/bash
+# ============================================================
+# PROJECT: STEELIX FUSION (MULTI-PHASE MASTER INSTALLER)
+# ARCHITECTURE: macOS (Darwin) + LAUNCHD + AI CORTEX
+# VERSION: 2.1 — MAC NATIVE EDITION
+# ============================================================
+
+if [[ $EUID -ne 0 ]]; then echo "[!] Root privileges required. Run with sudo."; exit 1; fi
+if [[ -z "$SUDO_USER" ]]; then echo "[!] Please run using sudo from a standard user account."; exit 1; fi
+
+# ============================================================
+# GLOBAL CONFIG
+# ============================================================
+INSTALL_DIR="/opt/Steelix_Fusion"
+VENV_DIR="$INSTALL_DIR/venv"
+PY_BIN="$VENV_DIR/bin/python3"
+PID_DIR="/var/run/steelix"
+LOG_DIR="/var/log/steelix"
+PORTS=(3001 3003 3004 8888)
+DAEMONS=(com.steelix.brain com.steelix.gyarados com.steelix.reporter com.steelix.region.boulder com.steelix.region.cascade com.steelix.region.thunder com.steelix.region.rainbow com.steelix.region.soul com.steelix.region.marsh com.steelix.region.volcano com.steelix.region.earth)
+
+echo "=================================================="
+echo "   STARTING STEELIX macOS UNIFICATION DEPLOYMENT  "
+echo "=================================================="
+
+wait_for_port() {
+    local PORT=$1
+    local LABEL=$2
+    local RETRIES=20
+    echo -n "[*] Waiting for $LABEL on :$PORT"
+    for i in $(seq 1 $RETRIES); do
+        if lsof -i :$PORT -sTCP:LISTEN >/dev/null 2>&1; then
+            echo " OK"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo " TIMEOUT"
+    return 1
+}
+
+# ============================================================
+# PHASE 1: CLEAN SHUTDOWN (launchd)
+# ============================================================
+echo -e "\n>>> PHASE 1: CLEAN SHUTDOWN"
+
+echo "[*] Unloading launchd daemons..."
+for D in "${DAEMONS[@]}"; do
+    if [[ -f "/Library/LaunchDaemons/$D.plist" ]]; then
+        launchctl unload "/Library/LaunchDaemons/$D.plist" 2>/dev/null
+        rm "/Library/LaunchDaemons/$D.plist"
+    fi
+done
+
+echo "[*] Waiting for ports to clear..."
+for PORT in "${PORTS[@]}"; do
+    RETRIES=10
+    while lsof -i :$PORT >/dev/null 2>&1 && [[ $RETRIES -gt 0 ]]; do
+        lsof -ti :$PORT | xargs kill -9 >/dev/null 2>&1
+        sleep 1
+        ((RETRIES--))
+    done
+done
+
+echo "[*] Purging legacy install directories..."
+rm -rf "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"/{brain,agent,cortex,pokegear,gyarados,reporter}
+mkdir -p "$LOG_DIR"
+mkdir -p "$PID_DIR"
+
+# ============================================================
+# PHASE 2: DEPENDENCIES & MEMORY CORE (BREW + MYSQL)
+# ============================================================
+echo -e "\n>>> PHASE 2: DEPENDENCIES & MEMORY CORE"
+
+# Run brew as the standard user
+echo "[*] Ensuring Homebrew dependencies..."
+sudo -u $SUDO_USER brew update >/dev/null 2>&1
+sudo -u $SUDO_USER brew install mariadb python3 >/dev/null 2>&1
+
+echo "[*] Starting MariaDB service..."
+sudo -u $SUDO_USER brew services start mariadb >/dev/null 2>&1
+sleep 5
+
+echo "[*] Forging Python Virtual Environment..."
+sudo -u $SUDO_USER python3 -m venv "$VENV_DIR"
+sudo -u $SUDO_USER "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null 2>&1
+sudo -u $SUDO_USER "$VENV_DIR/bin/pip" install pymysql pandas scikit-learn joblib flask >/dev/null 2>&1
+
+echo "[*] Provisioning database..."
+DB_PASS="steelix_$(openssl rand -hex 8)"
+cat > /etc/steelix.env << ENV
+STEELIX_DB_HOST=127.0.0.1
+STEELIX_DB_USER=steelix_user
+STEELIX_DB_PASS=${DB_PASS}
+STEELIX_DB_NAME=steelix_db
+ENV
+chmod 600 /etc/steelix.env
+
+# Execute queries as the user who owns brew mariadb
+sudo -u $SUDO_USER mysql -e "DROP USER IF EXISTS 'steelix_user'@'127.0.0.1';" 2>/dev/null
+sudo -u $SUDO_USER mysql -e "CREATE DATABASE IF NOT EXISTS steelix_db;"
+sudo -u $SUDO_USER mysql -e "CREATE USER 'steelix_user'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';"
+sudo -u $SUDO_USER mysql -e "GRANT ALL PRIVILEGES ON steelix_db.* TO 'steelix_user'@'127.0.0.1';"
+sudo -u $SUDO_USER mysql -e "FLUSH PRIVILEGES;"
+sudo -u $SUDO_USER mysql -e "
+USE steelix_db;
+CREATE TABLE IF NOT EXISTS system_logs (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    node_id     VARCHAR(50),
+    event_type  VARCHAR(50),
+    metric_signature TEXT,
+    raw_payload TEXT,
+    ai_score    FLOAT DEFAULT NULL,
+    INDEX idx_node (node_id),
+    INDEX idx_event (event_type),
+    INDEX idx_ts (timestamp)
+);"
+
+# ============================================================
+# PHASE 3: POKEGEAR & GYARADOS
+# ============================================================
+echo -e "\n>>> PHASE 3: POKEGEAR & GYARADOS"
+
+cat << 'PY_GEAR' > "$INSTALL_DIR/pokegear/phone.py"
+import datetime, os, threading
+LOG_FILE = "/opt/Steelix_Fusion/pokegear/call_history.log"
+_lock = threading.Lock()
+def make_call(source, message, priority="NORMAL"):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [{str(source)[:50]}] {str(message)[:200]} ({str(priority)[:20]})\n"
+    with _lock:
+        with open(LOG_FILE, "a") as f: f.write(line)
+PY_GEAR
+
+cat << 'PY_GYARA' > "$INSTALL_DIR/gyarados/rage.py"
+import socket, json, os, signal, sys
+from flask import Flask, request
+PID_FILE = "/var/run/steelix/gyarados.pid"
+
+def cleanup(signum, frame):
+    try: os.remove(PID_FILE)
+    except FileNotFoundError: pass
+    sys.exit(0)
+signal.signal(signal.SIGTERM, cleanup)
+signal.signal(signal.SIGINT, cleanup)
+
+app = Flask(__name__)
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def catch_all(path):
+    ip = request.remote_addr
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(2)
+        s.connect(('127.0.0.1', 3001))
+        s.sendall(json.dumps({"event": f"CRITICAL: RED GYARADOS BREACH! IP: {ip}"}).encode())
+        s.close()
+    except: pass
+    return "<h1>System Error 500</h1>", 500
+if __name__ == "__main__":
+    with open(PID_FILE, "w") as f: f.write(str(os.getpid()))
+    app.run(host='0.0.0.0', port=8888)
+PY_GYARA
+
+# ============================================================
+# PHASE 4: AI CORTEX
+# ============================================================
+echo -e "\n>>> PHASE 4: AI CORTEX"
+
+cat << 'PY_TRAIN' > "$INSTALL_DIR/cortex/train.py"
+import pymysql, pandas as pd, re, joblib, sys, json, os
+
+def get_db_config():
+    cfg = {}
+    with open("/etc/steelix.env") as f:
+        for line in f: k, _, v = line.strip().partition("="); cfg[k] = v
+    return {
+        'host': cfg.get('STEELIX_DB_HOST', '127.0.0.1'),
+        'user': cfg.get('STEELIX_DB_USER'),
+        'password': cfg.get('STEELIX_DB_PASS'),
+        'database': cfg.get('STEELIX_DB_NAME')
+    }
+
+def train():
+    from sklearn.ensemble import IsolationForest
+    db = get_db_config()
+    try:
+        conn = pymysql.connect(**db)
+        df = pd.read_sql("SELECT raw_payload FROM system_logs WHERE event_type LIKE 'HEARTBEAT%' ORDER BY id DESC LIMIT 2000", conn)
+        conn.close()
+    except Exception as e: sys.exit(1)
+
+    data = []
+    for payload_str in df['raw_payload']:
+        try:
+            p = json.loads(payload_str); load = float(p.get('load', 0))
+            match = re.search(r'\[(\d+)', p.get('signature', ''))
+            if match: data.append([load, int(match.group(1))])
+        except: continue
+
+    if len(data) < 10: print("[!] Not enough data to train."); sys.exit(1)
+    
+    model = IsolationForest(contamination=0.1, random_state=42)
+    model.fit(pd.DataFrame(data, columns=[0, 1]))
+    joblib.dump(model, "/opt/Steelix_Fusion/cortex/kanto_model.pkl")
+    print("[*] AI Model trained.")
+
+if __name__ == "__main__": train()
+PY_TRAIN
+
+cat << TRAIN_SH > /usr/local/bin/steelix-train
+#!/bin/bash
+$PY_BIN /opt/Steelix_Fusion/cortex/train.py
+TRAIN_SH
+chmod +x /usr/local/bin/steelix-train
+
+# ============================================================
+# PHASE 5: THE BRAIN (C2 CORE)
+# ============================================================
+echo -e "\n>>> PHASE 5: INDIGO PLATEAU (BRAIN)"
+
+cat << 'PY_BRAIN' > "$INSTALL_DIR/brain/core.py"
+import socket, json, time, threading, os, signal, sys, pymysql, joblib, re, pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+sys.path.append("/opt/Steelix_Fusion/pokegear")
+import phone
+
+PID_FILE = "/var/run/steelix/brain.pid"
+READY_FILE = "/var/run/steelix/brain.ready"
+
+def get_db_config():
+    cfg = {}
+    with open("/etc/steelix.env") as f:
+        for line in f: k, _, v = line.strip().partition("="); cfg[k] = v
+    return {
+        'host': cfg.get('STEELIX_DB_HOST', '127.0.0.1'),
+        'user': cfg.get('STEELIX_DB_USER'),
+        'password': cfg.get('STEELIX_DB_PASS'),
+        'database': cfg.get('STEELIX_DB_NAME'), 'autocommit': True
+    }
+
+class FusionBrain:
+    def __init__(self):
+        self.lock = threading.Lock(); self.nodes = {}
+        self.threat_level = "GREEN"; self.broadcast_cmd = "STANDBY"
+        self.ports = {'ingest': 3001, 'admin': 3003, 'pulse': 3004}
+        self.db = get_db_config(); self.model = None
+        try: self.model = joblib.load("/opt/Steelix_Fusion/cortex/kanto_model.pkl")
+        except: pass
+
+    def log(self, nid, evt, sig, payload, score=None):
+        try:
+            conn = pymysql.connect(**self.db)
+            with conn.cursor() as c: c.execute("INSERT INTO system_logs (node_id, event_type, metric_signature, raw_payload, ai_score) VALUES (%s, %s, %s, %s, %s)", (nid, evt, sig, json.dumps(payload), score))
+            conn.close()
+        except: pass
+
+    def judge(self, payload):
+        if not self.model: return None
+        try:
+            load = float(payload.get('load', 0))
+            match = re.search(r'\[(\d+)', payload.get('signature', ''))
+            if not match: return None
+            return int(self.model.predict(pd.DataFrame([[load, int(match.group(1))]], columns=[0, 1]))[0])
+        except: return None
+
+    def handle(self, conn, p_type):
+        with conn:
+            try:
+                conn.settimeout(5); data = conn.recv(4096)
+                if not data: return
+                if p_type == 'admin':
+                    with self.lock:
+                        now = time.time()
+                        self.nodes = {k: v for k, v in self.nodes.items() if now - v['last_seen'] < 20}
+                        conn.sendall(json.dumps({"system": "STEELIX macOS", "threat_level": self.threat_level, "broadcast": self.broadcast_cmd, "nodes_detail": self.nodes}).encode())
+                elif p_type == 'pulse':
+                    pl = json.loads(data.decode()); nid = str(pl.get('id', 'UNKNOWN'))[:50]; tel = pl.get('data', {})
+                    verdict = self.judge(tel); tag = "NORMAL"
+                    if verdict == -1:
+                        tag = "ANOMALY"; self.threat_level = "YELLOW"
+                        phone.make_call(nid, f"Anomaly: {tel.get('signature')}", "HIGH")
+                    tel['status'] = tag
+                    with self.lock: self.nodes[nid] = {'last_seen': time.time(), 'telemetry': tel}
+                    conn.sendall(json.dumps({"order": self.broadcast_cmd}).encode())
+                    self.log(nid, f"HEARTBEAT_{tag}", tel.get('signature', ''), tel, verdict)
+                elif p_type == 'ingest':
+                    pl = json.loads(data.decode()); msg = str(pl.get('event', ''))[:500].upper()
+                    if "BROADCAST:" in msg:
+                        cmd = msg.split(":", 1)[1].strip()
+                        if cmd in {"STANDBY", "SILENCE", "ALERT", "RESET"}:
+                            with self.lock: self.broadcast_cmd = cmd
+                            phone.make_call("RADIO_TOWER", f"Order: {cmd}", "CMD")
+                    elif "CRITICAL" in msg:
+                        with self.lock: self.threat_level = "RED"
+                        phone.make_call("RED_GYARADOS", msg, "URGENT")
+                    elif "RESET" in msg:
+                        with self.lock: self.threat_level = "GREEN"; self.broadcast_cmd = "STANDBY"
+                    self.log("CORE", "EVENT", msg, pl)
+            except: pass
+
+    def listener(self, port, p_type):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('0.0.0.0', port)); s.listen(50)
+        with ThreadPoolExecutor(max_workers=20) as exe:
+            while True:
+                try: conn, _ = s.accept(); exe.submit(self.handle, conn, p_type)
+                except: pass
+
+    def start(self):
+        with open(PID_FILE, "w") as f: f.write(str(os.getpid()))
+        for p_type, port in self.ports.items():
+            threading.Thread(target=self.listener, args=(port, p_type), daemon=True).start()
+        time.sleep(0.5)
+        with open(READY_FILE, "w") as f: f.write(str(time.time()))
+        while True: time.sleep(1)
+
+if __name__ == "__main__": FusionBrain().start()
+PY_BRAIN
+
+# ============================================================
+# PHASE 6: AGENTS (DARWIN TUNED)
+# ============================================================
+echo -e "\n>>> PHASE 6: THE 8 GYM LEADERS (DARWIN COMMANDS)"
+
+cat << 'PY_AGENT' > "$INSTALL_DIR/agent/core.py"
+import socket, json, time, os, subprocess, signal, sys
+
+REGION = os.getenv("REGION_ID", "UNKNOWN")
+READY_FILE = "/var/run/steelix/brain.ready"
+
+def run(cmd):
+    try: return subprocess.check_output(cmd, shell=True, timeout=3).decode().strip()
+    except: return "ERR"
+
+def get_sig():
+    # macOS Specific Diagnostics
+    if "BOULDER" in REGION:  return f"Iron Defense [{run('kextstat | tail -n +2 | wc -l').strip()}]"
+    if "CASCADE" in REGION:  return f"Bubble Beam [{run('lsof -i -n -P | wc -l').strip()}]"
+    if "THUNDER" in REGION:  return f"Thunderbolt [{run('sysctl -n machdep.xcpm.cpu_thermal_level') or '0'}C]"
+    if "RAINBOW" in REGION:  return f"Mega Drain [{run(\"df -h / | awk 'NR==2 {print $5}'\")}]"
+    if "SOUL"    in REGION:  return f"Toxic [{run('ps axo stat | grep -c Z || true').strip()}]"
+    if "MARSH"   in REGION:  return f"Future Sight [{run(\"vm_stat | grep 'Pages active' | awk '{print $3}' | tr -d '.'\")}P]"
+    if "VOLCANO" in REGION:  return f"Fire Blast [{os.getloadavg()[2]:.2f}]"
+    if "EARTH"   in REGION:  return f"Earthquake [{run('who | wc -l').strip()}]"
+    return "-"
+
+while not os.path.exists(READY_FILE): time.sleep(1)
+
+while True:
+    try:
+        tel = {"load": str(os.getloadavg()[0]), "signature": get_sig()}
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(5)
+        s.connect(('127.0.0.1', 3004))
+        s.sendall(json.dumps({"id": REGION, "data": tel}).encode())
+        resp = s.recv(1024)
+        if resp and json.loads(resp.decode()).get("order") == "SILENCE": time.sleep(20)
+        s.close()
+    except: time.sleep(10); continue
+    time.sleep(5)
+PY_AGENT
+
+# ============================================================
+# PHASE 7: LAUNCHD DAEMONS & REPORTER
+# ============================================================
+echo -e "\n>>> PHASE 7: LAUNCHD PROVISIONING"
+
+create_plist() {
+    local NAME=$1; local SCRIPT=$2; local ENV_KEY=$3; local ENV_VAL=$4
+    cat << EOF > "/Library/LaunchDaemons/$NAME.plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$NAME</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PY_BIN</string><string>-u</string><string>$SCRIPT</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$LOG_DIR/${NAME##*.}.log</string>
+    <key>StandardErrorPath</key><string>$LOG_DIR/${NAME##*.}.log</string>
+EOF
+    if [[ -n "$ENV_KEY" ]]; then
+        cat << EOF >> "/Library/LaunchDaemons/$NAME.plist"
+    <key>EnvironmentVariables</key>
+    <dict><key>$ENV_KEY</key><string>$ENV_VAL</string></dict>
+EOF
+    fi
+    echo "</dict></plist>" >> "/Library/LaunchDaemons/$NAME.plist"
+}
+
+create_plist "com.steelix.brain" "$INSTALL_DIR/brain/core.py"
+create_plist "com.steelix.gyarados" "$INSTALL_DIR/gyarados/rage.py"
+for GYM in boulder cascade thunder rainbow soul marsh volcano earth; do
+    UPPER=$(echo "$GYM" | tr '[:lower:]' '[:upper:]')
+    create_plist "com.steelix.region.$GYM" "$INSTALL_DIR/agent/core.py" "REGION_ID" "REGION_${UPPER}"
+done
+
+cat << 'PY_REPORT' > "$INSTALL_DIR/reporter/summary.py"
+import pymysql, datetime, sys
+sys.path.append("/opt/Steelix_Fusion/pokegear")
+import phone
+def get_db():
+    cfg = {}
+    with open("/etc/steelix.env") as f:
+        for l in f: k,_,v=l.strip().partition("="); cfg[k]=v
+    return {'host':'127.0.0.1','user':cfg.get('STEELIX_DB_USER'),'password':cfg.get('STEELIX_DB_PASS'),'database':cfg.get('STEELIX_DB_NAME')}
+def run():
+    try:
+        conn = pymysql.connect(**get_db())
+        with conn.cursor() as c:
+            c.execute("SELECT event_type, COUNT(*) FROM system_logs WHERE timestamp >= NOW() - INTERVAL 1 DAY GROUP BY event_type")
+            stats = c.fetchall()
+            c.execute("SELECT node_id, metric_signature FROM system_logs WHERE event_type = 'HEARTBEAT_ANOMALY' AND timestamp >= NOW() - INTERVAL 1 DAY")
+            anomalies = c.fetchall()
+        conn.close()
+    except Exception as e: return
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report = f"=== SILPH CO. MAC SYSTEM BRIEFING ({now}) ===\nTotal Events: {sum([r[1] for r in stats]) if stats else 0}\n\nANOMALIES DETECTED: {len(anomalies)}\n"
+    for a in anomalies: report += f"  > [{a[0]}] {a[1]}\n"
+    with open("/var/log/steelix/daily_summary.txt", "w") as f: f.write(report)
+    phone.make_call("REPORTER", f"Report Gen. Anomalies: {len(anomalies)}", "INFO")
+if __name__ == '__main__': run()
+PY_REPORT
+
+# Timer for Midnight
+cat << EOF > /Library/LaunchDaemons/com.steelix.reporter.plist
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.steelix.reporter</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PY_BIN</string><string>$INSTALL_DIR/reporter/summary.py</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
+    <key>StandardOutPath</key><string>$LOG_DIR/reporter.log</string>
+    <key>StandardErrorPath</key><string>$LOG_DIR/reporter.log</string>
+</dict>
+</plist>
+EOF
+
+# ============================================================
+# PHASE 8: CLI DASHBOARD & EXECUTION
+# ============================================================
+echo -e "\n>>> PHASE 8: CLI DASHBOARD"
+
+cat << 'CLI_TOOL' > /usr/local/bin/steelix
+#!/usr/bin/env python3
+import sys, socket, json, os
+
+G, Y, R, X, C = "\033[96m", "\033[93m", "\033[91m", "\033[0m", "\033[94m"
+def send_raw(port, payload_bytes, recv=False):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(5); s.connect(('127.0.0.1', port))
+        s.sendall(payload_bytes); return s.recv(4096) if recv else b""
+    except: return None
+
+def status():
+    data = send_raw(3003, b"STATUS", recv=True)
+    if not data: print(f"{R}[!] DISCONNECTED (Brain offline){X}"); return
+    d = json.loads(data.decode())
+    th = d.get("threat_level", "UNKNOWN"); bc = d.get("broadcast", "STANDBY")
+    print(f"\n\033[1mSTEELIX FUSION macOS (GEN II){X}\n" + "="*60)
+    print(f" GLOBAL STATE:  {R if th=='RED' else (Y if th=='YELLOW' else G)}{th}{X}")
+    print(f" RADIO TOWER:   {R if bc!='STANDBY' else G}{bc}{X}\n" + "="*60)
+    try:
+        with open("/opt/Steelix_Fusion/pokegear/call_history.log") as f:
+            for line in f.readlines()[-2:]: print(f" \033[90m> {line.strip()}{X}")
+    except: pass
+    print("="*60)
+    nodes = d.get("nodes_detail", {})
+    if not nodes: print(f" {R}NO ACTIVE REGIONS{X}")
+    else:
+        print(f"{'BADGE':<15} {'STATUS':<12} SIGNATURE\n" + "-"*60)
+        for b in ["BOULDER","CASCADE","THUNDER","RAINBOW","SOUL","MARSH","VOLCANO","EARTH"]:
+            if f"REGION_{b}" in nodes:
+                tel = nodes[f"REGION_{b}"].get('telemetry', {})
+                sta = tel.get('status', '?'); col = R if sta == "ANOMALY" else G
+                print(f"{G}{b:<15}{X} {col}{sta:<12}{X} {tel.get('signature', '-')}")
+    print()
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1: status()
+    elif sys.argv[1] == "broadcast" and len(sys.argv) > 2: send_raw(3001, json.dumps({"event": f"BROADCAST:{sys.argv[2].upper()}"}).encode())
+    elif sys.argv[1] == "train": os.execv("/usr/local/bin/steelix-train", ["steelix-train"])
+    elif sys.argv[1] == "report":
+        try: 
+            with open("/var/log/steelix/daily_summary.txt", "r") as f: print(f.read())
+        except: print("[!] No daily report found.")
+    else: print("Commands: [none] (status), broadcast <CMD>, train, report")
+CLI_TOOL
+chmod +x /usr/local/bin/steelix
+
+# Start macOS Daemons
+echo "[*] Loading Daemons into launchctl..."
+launchctl load -w /Library/LaunchDaemons/com.steelix.brain.plist
+wait_for_port 3001 "brain/ingest"
+
+launchctl load -w /Library/LaunchDaemons/com.steelix.gyarados.plist
+launchctl load -w /Library/LaunchDaemons/com.steelix.reporter.plist
+for GYM in boulder cascade thunder rainbow soul marsh volcano earth; do
+    launchctl load -w /Library/LaunchDaemons/com.steelix.region.$GYM.plist
+done
+
+echo -e "\n=================================================="
+echo "   STEELIX macOS UNIFICATION DEPLOYED"
+echo "   Run 'steelix' to view status."
+echo "=================================================="

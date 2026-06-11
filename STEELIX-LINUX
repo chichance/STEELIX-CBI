@@ -1,0 +1,900 @@
+#!/bin/bash
+# ============================================================
+# PROJECT: STEELIX FUSION (MULTI-PHASE MASTER INSTALLER)
+# ARCHITECTURE: BARE METAL + SYSTEMD + AI CORTEX
+# VERSION: 2.1 — CONFLICT-SAFE + DAILY REPORTING EDITION
+# ============================================================
+
+if [[ $EUID -ne 0 ]]; then echo "[!] Root privileges required."; exit 1; fi
+
+# ============================================================
+# GLOBAL CONFIG
+# ============================================================
+INSTALL_DIR="/opt/Steelix_Fusion"
+PID_DIR="/var/run/steelix"
+LOG_DIR="/var/log/steelix"
+PORTS=(3001 3003 3004 8888)
+SERVICES=(steelix-brain steelix-gyarados steelix-reporter.timer $(for g in boulder cascade thunder rainbow soul marsh volcano earth; do echo steelix-region-$g; done))
+
+echo "=================================================="
+echo "   STARTING STEELIX GRAND UNIFICATION DEPLOYMENT  "
+echo "=================================================="
+
+# ============================================================
+# UTILITY: wait for a TCP port to open (used for readiness)
+# ============================================================
+wait_for_port() {
+    local PORT=$1
+    local LABEL=$2
+    local RETRIES=20
+    echo -n "[*] Waiting for $LABEL on :$PORT"
+    for i in $(seq 1 $RETRIES); do
+        if ss -tlnH "sport = :$PORT" | grep -q "$PORT"; then
+            echo " OK"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo " TIMEOUT"
+    return 1
+}
+
+# ============================================================
+# UTILITY: wait for MariaDB to accept connections
+# ============================================================
+wait_for_mysql() {
+    local RETRIES=20
+    echo -n "[*] Waiting for MariaDB"
+    for i in $(seq 1 $RETRIES); do
+        if mysqladmin ping --silent 2>/dev/null; then
+            echo " OK"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo " TIMEOUT"
+    return 1
+}
+
+# ============================================================
+# PHASE 1: CLEAN SHUTDOWN — targeted, ordered, verified
+# ============================================================
+echo -e "\n>>> PHASE 1: CLEAN SHUTDOWN"
+
+echo "[*] Stopping systemd services in dependency order..."
+for GYM in boulder cascade thunder rainbow soul marsh volcano earth; do
+    systemctl stop steelix-region-$GYM 2>/dev/null
+done
+systemctl stop steelix-reporter.timer 2>/dev/null
+systemctl stop steelix-brain 2>/dev/null
+systemctl stop steelix-gyarados 2>/dev/null
+
+echo "[*] Disabling services..."
+for SVC in "${SERVICES[@]}"; do
+    systemctl disable "$SVC" 2>/dev/null
+done
+
+echo "[*] Waiting for ports to clear..."
+for PORT in "${PORTS[@]}"; do
+    RETRIES=10
+    while ss -tlnH "sport = :$PORT" | grep -q "$PORT" && [[ $RETRIES -gt 0 ]]; do
+        fuser -k "$PORT/tcp" >/dev/null 2>&1
+        sleep 1
+        ((RETRIES--))
+    done
+    if ss -tlnH "sport = :$PORT" | grep -q "$PORT"; then
+        echo "[!] WARNING: Port $PORT still in use. Check manually."
+    else
+        echo "[*] Port $PORT cleared."
+    fi
+done
+
+echo "[*] Removing PID files..."
+mkdir -p "$PID_DIR"
+rm -f "$PID_DIR"/*.pid
+
+echo "[*] Purging legacy install directory..."
+rm -rf "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"/{brain,agent,cortex,pokegear,gyarados,reporter}
+mkdir -p "$LOG_DIR"
+
+# ============================================================
+# PHASE 2: DEPENDENCIES & MEMORY CORE (MYSQL)
+# ============================================================
+echo -e "\n>>> PHASE 2: DEPENDENCIES & MEMORY CORE"
+
+echo "[*] Installing system packages..."
+apt-get update -qq
+apt-get install -y \
+    mariadb-server \
+    python3-pymysql \
+    python3-pandas \
+    python3-sklearn \
+    python3-joblib \
+    python3-flask > /dev/null 2>&1
+
+echo "[*] Starting MariaDB..."
+systemctl enable --now mariadb
+wait_for_mysql || { echo "[!] MariaDB failed to start. Aborting."; exit 1; }
+
+echo "[*] Provisioning database..."
+DB_PASS="steelix_$(openssl rand -hex 8)"
+cat > /etc/steelix.env << ENV
+STEELIX_DB_HOST=localhost
+STEELIX_DB_USER=steelix_user
+STEELIX_DB_PASS=${DB_PASS}
+STEELIX_DB_NAME=steelix_db
+ENV
+chmod 600 /etc/steelix.env
+
+mysql -e "DROP USER IF EXISTS 'steelix_user'@'localhost';"
+mysql -e "CREATE DATABASE IF NOT EXISTS steelix_db;"
+mysql -e "CREATE USER 'steelix_user'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+mysql -e "GRANT ALL PRIVILEGES ON steelix_db.* TO 'steelix_user'@'localhost';"
+mysql -e "FLUSH PRIVILEGES;"
+mysql -e "
+USE steelix_db;
+CREATE TABLE IF NOT EXISTS system_logs (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    node_id     VARCHAR(50),
+    event_type  VARCHAR(50),
+    metric_signature TEXT,
+    raw_payload TEXT,
+    ai_score    FLOAT DEFAULT NULL,
+    INDEX idx_node (node_id),
+    INDEX idx_event (event_type),
+    INDEX idx_ts (timestamp)
+);"
+echo "[*] Database ready."
+
+# ============================================================
+# PHASE 3: POKEGEAR LOGGING SUBSYSTEM
+# ============================================================
+echo -e "\n>>> PHASE 3: POKEGEAR & GYARADOS"
+
+cat << 'PY_GEAR' > "$INSTALL_DIR/pokegear/phone.py"
+import datetime, os, threading
+
+LOG_FILE = "/opt/Steelix_Fusion/pokegear/call_history.log"
+_lock = threading.Lock()
+
+def make_call(source, message, priority="NORMAL"):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    source = str(source)[:50]
+    message = str(message)[:200]
+    priority = str(priority)[:20]
+    line = f"[{ts}] [{source}] {message} ({priority})\n"
+    with _lock:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+PY_GEAR
+
+cat << 'PY_GYARA' > "$INSTALL_DIR/gyarados/rage.py"
+import socket, json, os, signal, sys
+from flask import Flask, request
+
+PID_FILE = "/var/run/steelix/gyarados.pid"
+
+def write_pid():
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+def cleanup(signum, frame):
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, cleanup)
+signal.signal(signal.SIGINT, cleanup)
+
+app = Flask(__name__)
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def catch_all(path):
+    ip = request.remote_addr
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(('127.0.0.1', 3001))
+        payload = json.dumps({"event": f"CRITICAL: RED GYARADOS BREACH! IP: {ip}"})
+        s.sendall(payload.encode())
+        s.close()
+    except Exception:
+        pass
+    return "<h1>System Error 500</h1>", 500
+
+if __name__ == "__main__":
+    write_pid()
+    app.run(host='0.0.0.0', port=8888)
+PY_GYARA
+
+# ============================================================
+# PHASE 4: AI CORTEX
+# ============================================================
+echo -e "\n>>> PHASE 4: AI CORTEX"
+
+cat << 'PY_TRAIN' > "$INSTALL_DIR/cortex/train.py"
+import pymysql, pandas as pd, re, joblib, sys, json, os
+
+def get_db_config():
+    cfg = {}
+    try:
+        with open("/etc/steelix.env") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                cfg[k] = v
+    except Exception as e:
+        print(f"[!] Could not read /etc/steelix.env: {e}")
+        sys.exit(1)
+    return {
+        'host':     cfg.get('STEELIX_DB_HOST', 'localhost'),
+        'user':     cfg.get('STEELIX_DB_USER'),
+        'password': cfg.get('STEELIX_DB_PASS'),
+        'database': cfg.get('STEELIX_DB_NAME'),
+    }
+
+def train():
+    from sklearn.ensemble import IsolationForest
+    db = get_db_config()
+    try:
+        conn = pymysql.connect(**db)
+        df = pd.read_sql(
+            "SELECT raw_payload FROM system_logs "
+            "WHERE event_type LIKE 'HEARTBEAT%' "
+            "ORDER BY id DESC LIMIT 2000",
+            conn
+        )
+        conn.close()
+    except Exception as e:
+        print(f"[!] DB error: {e}")
+        sys.exit(1)
+
+    if len(df) < 10:
+        print("[!] Not enough data to train (need >= 10 heartbeat rows).")
+        sys.exit(1)
+
+    data = []
+    for payload_str in df['raw_payload']:
+        try:
+            p = json.loads(payload_str)
+            load = float(p.get('load', 0))
+            sig = p.get('signature', '')
+            match = re.search(r'\[(\d+)', sig)
+            if not match:
+                continue
+            val = int(match.group(1))
+            data.append([load, val])
+        except Exception:
+            continue
+
+    if len(data) < 10:
+        print("[!] Not enough parseable rows after extraction.")
+        sys.exit(1)
+
+    df_train = pd.DataFrame(data, columns=[0, 1])
+    model = IsolationForest(contamination=0.1, random_state=42)
+    model.fit(df_train)
+    out = "/opt/Steelix_Fusion/cortex/kanto_model.pkl"
+    joblib.dump(model, out)
+    print(f"[*] AI Model trained on {len(data)} samples → {out}")
+
+if __name__ == "__main__":
+    train()
+PY_TRAIN
+
+cat << 'TRAIN_SH' > /usr/local/bin/steelix-train
+#!/bin/bash
+python3 /opt/Steelix_Fusion/cortex/train.py
+TRAIN_SH
+chmod +x /usr/local/bin/steelix-train
+
+# ============================================================
+# PHASE 5: THE BRAIN (C2 CORE)
+# ============================================================
+echo -e "\n>>> PHASE 5: INDIGO PLATEAU (BRAIN)"
+
+cat << 'PY_BRAIN' > "$INSTALL_DIR/brain/core.py"
+import socket, json, time, threading, os, signal, sys
+import pymysql, joblib, re
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.append("/opt/Steelix_Fusion/pokegear")
+import phone
+
+PID_FILE = "/var/run/steelix/brain.pid"
+READY_FILE = "/var/run/steelix/brain.ready"
+
+def get_db_config():
+    cfg = {}
+    try:
+        with open("/etc/steelix.env") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                cfg[k] = v
+    except Exception as e:
+        print(f"[!] Could not read /etc/steelix.env: {e}", flush=True)
+        sys.exit(1)
+    return {
+        'host':        cfg.get('STEELIX_DB_HOST', 'localhost'),
+        'user':        cfg.get('STEELIX_DB_USER'),
+        'password':    cfg.get('STEELIX_DB_PASS'),
+        'database':    cfg.get('STEELIX_DB_NAME'),
+        'autocommit':  True,
+    }
+
+class FusionBrain:
+    def __init__(self):
+        self.lock           = threading.Lock()
+        self.nodes          = {}
+        self.threat_level   = "GREEN"
+        self.broadcast_cmd  = "STANDBY"
+        self.ports          = {'ingest': 3001, 'admin': 3003, 'pulse': 3004}
+        self.db             = get_db_config()
+        self.model          = None
+        self._load_model()
+
+    def _load_model(self):
+        path = "/opt/Steelix_Fusion/cortex/kanto_model.pkl"
+        try:
+            self.model = joblib.load(path)
+            print(f"[*] AI model loaded from {path}", flush=True)
+        except FileNotFoundError:
+            print("[*] No AI model found — anomaly detection disabled until trained.", flush=True)
+        except Exception as e:
+            print(f"[!] Model load error: {e}", flush=True)
+
+    def log(self, nid, evt, sig, payload, score=None):
+        try:
+            conn = pymysql.connect(**self.db)
+            with conn.cursor() as c:
+                c.execute(
+                    "INSERT INTO system_logs "
+                    "(node_id, event_type, metric_signature, raw_payload, ai_score) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (nid, evt, sig, json.dumps(payload), score)
+                )
+            conn.close()
+        except Exception as e:
+            print(f"[!] DB log error: {e}", flush=True)
+
+    def judge(self, payload):
+        if not self.model: return None
+        try:
+            load = float(payload.get('load', 0))
+            sig  = payload.get('signature', '')
+            match = re.search(r'\[(\d+)', sig)
+            if not match: return None
+            val = int(match.group(1))
+            result = self.model.predict(pd.DataFrame([[load, val]], columns=[0, 1]))
+            return int(result[0])
+        except Exception as e:
+            print(f"[!] Judge error: {e}", flush=True)
+            return None
+
+    def handle(self, conn, p_type):
+        with conn:
+            try:
+                conn.settimeout(5)
+                data = conn.recv(4096)
+                if not data: return
+
+                if p_type == 'admin':
+                    with self.lock:
+                        now = time.time()
+                        self.nodes = {k: v for k, v in self.nodes.items() if now - v['last_seen'] < 20}
+                        response = {
+                            "system":       "STEELIX FUSION (GEN II)",
+                            "threat_level": self.threat_level,
+                            "broadcast":    self.broadcast_cmd,
+                            "nodes_detail": self.nodes,
+                        }
+                    conn.sendall(json.dumps(response).encode())
+
+                elif p_type == 'pulse':
+                    pl  = json.loads(data.decode())
+                    nid = str(pl.get('id', 'UNKNOWN'))[:50]
+                    tel = pl.get('data', {})
+
+                    verdict = self.judge(tel)
+                    tag     = "NORMAL"
+
+                    if verdict == -1:
+                        tag = "ANOMALY"
+                        with self.lock: self.threat_level = "YELLOW"
+                        phone.make_call(nid, f"Anomaly: {tel.get('signature')}", "HIGH")
+
+                    tel['status'] = tag
+                    with self.lock:
+                        self.nodes[nid] = {'last_seen': time.time(), 'telemetry': tel}
+
+                    conn.sendall(json.dumps({"order": self.broadcast_cmd}).encode())
+                    self.log(nid, f"HEARTBEAT_{tag}", tel.get('signature', ''), tel, verdict)
+
+                elif p_type == 'ingest':
+                    pl  = json.loads(data.decode())
+                    msg = str(pl.get('event', ''))[:500].upper()
+
+                    if "BROADCAST:" in msg:
+                        parts = msg.split(":", 1)
+                        cmd = parts[1].strip() if len(parts) > 1 else ""
+                        ALLOWED = {"STANDBY", "SILENCE", "ALERT", "RESET"}
+                        if cmd in ALLOWED:
+                            with self.lock: self.broadcast_cmd = cmd
+                            phone.make_call("RADIO_TOWER", f"Order: {cmd}", "CMD")
+                        else:
+                            print(f"[!] Rejected unknown broadcast command: {cmd}", flush=True)
+                    elif "CRITICAL" in msg:
+                        with self.lock: self.threat_level = "RED"
+                        phone.make_call("RED_GYARADOS", msg, "URGENT")
+                    elif "FAIL" in msg:
+                        with self.lock: self.threat_level = "YELLOW"
+                    elif "RESET" in msg:
+                        with self.lock:
+                            self.threat_level  = "GREEN"
+                            self.broadcast_cmd = "STANDBY"
+
+                    self.log("CORE", "EVENT", msg, pl)
+
+            except json.JSONDecodeError: pass
+            except Exception as e: print(f"[!] Handler error ({p_type}): {e}", flush=True)
+
+    def listener(self, port, p_type):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try: s.bind(('0.0.0.0', port))
+        except OSError as e: sys.exit(1)
+        s.listen(50)
+        with ThreadPoolExecutor(max_workers=20) as exe:
+            while True:
+                try:
+                    conn, _ = s.accept()
+                    exe.submit(self.handle, conn, p_type)
+                except Exception: pass
+
+    def _write_pid(self):
+        os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+        with open(PID_FILE, "w") as f: f.write(str(os.getpid()))
+
+    def _signal_ready(self):
+        with open(READY_FILE, "w") as f: f.write(str(time.time()))
+
+    def _cleanup(self, signum, frame):
+        for path in (PID_FILE, READY_FILE):
+            try: os.remove(path)
+            except FileNotFoundError: pass
+        sys.exit(0)
+
+    def start(self):
+        self._write_pid()
+        signal.signal(signal.SIGTERM, self._cleanup)
+        signal.signal(signal.SIGINT,  self._cleanup)
+
+        print("[*] FUSION BRAIN ONLINE", flush=True)
+        for p_type, port in self.ports.items():
+            threading.Thread(target=self.listener, args=(port, p_type), daemon=True).start()
+
+        time.sleep(0.5)
+        self._signal_ready()
+        while True: time.sleep(1)
+
+if __name__ == "__main__":
+    FusionBrain().start()
+PY_BRAIN
+
+# ============================================================
+# PHASE 6: AGENTS
+# ============================================================
+echo -e "\n>>> PHASE 6: THE 8 GYM LEADERS"
+
+cat << 'PY_AGENT' > "$INSTALL_DIR/agent/core.py"
+import socket, json, time, os, subprocess, signal, sys
+
+REGION    = os.getenv("REGION_ID", "UNKNOWN")
+BRAIN_IP  = "127.0.0.1"
+BRAIN_PORT = 3004
+READY_FILE = "/var/run/steelix/brain.ready"
+
+def run(cmd):
+    try: return subprocess.check_output(cmd, shell=True, timeout=3).decode().strip()
+    except Exception: return "ERR"
+
+def get_sig():
+    if "BOULDER" in REGION:  return f"Iron Defense [{run('lsmod | wc -l')}]"
+    if "CASCADE" in REGION:  return f"Bubble Beam [{run('ss -tunH | wc -l')}]"
+    if "THUNDER" in REGION:
+        raw = run("cat /sys/class/thermal/thermal_zone0/temp")
+        temp = raw[:-3] if len(raw) > 3 else "0"
+        return f"Thunderbolt [{temp}C]"
+    if "RAINBOW" in REGION:  return f"Mega Drain [{run(\"df -h / | awk 'NR==2 {print $5}'\")  }]"
+    if "SOUL"    in REGION:  return f"Toxic [{run('ps axo stat | grep -c Z || true')}]"
+    if "MARSH"   in REGION:  return f"Future Sight [{run(\"free | grep Mem | awk '{print int($3/$2*100)}'\") }%]"
+    if "VOLCANO" in REGION:  return f"Fire Blast [{os.getloadavg()[2]:.2f}]"
+    if "EARTH"   in REGION:  return f"Earthquake [{run('who | wc -l')}]"
+    return "-"
+
+def wait_for_brain(timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(READY_FILE): return True
+        time.sleep(1)
+    return False
+
+def cleanup(signum, frame):
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, cleanup)
+signal.signal(signal.SIGINT,  cleanup)
+
+if not wait_for_brain(): sys.exit(1)
+
+while True:
+    try:
+        tel = {"load": str(os.getloadavg()[0]), "signature": get_sig()}
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((BRAIN_IP, BRAIN_PORT))
+        s.sendall(json.dumps({"id": REGION, "data": tel}).encode())
+        resp = s.recv(1024)
+        if resp:
+            order = json.loads(resp.decode()).get("order", "STANDBY")
+            if order == "SILENCE": time.sleep(20)
+        s.close()
+    except ConnectionRefusedError:
+        time.sleep(10)
+        continue
+    except Exception: pass
+    time.sleep(5)
+PY_AGENT
+
+# ============================================================
+# PHASE 7: SYSTEMD WIRING
+# ============================================================
+echo -e "\n>>> PHASE 7: SYSTEMD WIRING"
+
+cat << SVC > /etc/systemd/system/steelix-brain.service
+[Unit]
+Description=Steelix Fusion Brain (C2 Core)
+After=network.target mariadb.service
+Requires=mariadb.service
+[Service]
+ExecStart=/usr/bin/python3 -u /opt/Steelix_Fusion/brain/core.py
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 20); do [ -f /var/run/steelix/brain.ready ] && exit 0; sleep 1; done; exit 1'
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=append:/var/log/steelix/brain.log
+StandardError=append:/var/log/steelix/brain.log
+PIDFile=/var/run/steelix/brain.pid
+[Install]
+WantedBy=multi-user.target
+SVC
+
+cat << SVC > /etc/systemd/system/steelix-gyarados.service
+[Unit]
+Description=Steelix Red Gyarados Honeypot
+After=steelix-brain.service
+Requires=steelix-brain.service
+[Service]
+ExecStart=/usr/bin/python3 -u /opt/Steelix_Fusion/gyarados/rage.py
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=append:/var/log/steelix/gyarados.log
+StandardError=append:/var/log/steelix/gyarados.log
+PIDFile=/var/run/steelix/gyarados.pid
+[Install]
+WantedBy=multi-user.target
+SVC
+
+GYMS=("boulder" "cascade" "thunder" "rainbow" "soul" "marsh" "volcano" "earth")
+for GYM in "${GYMS[@]}"; do
+    UPPER=$(echo "$GYM" | tr '[:lower:]' '[:upper:]')
+    cat << SVC > /etc/systemd/system/steelix-region-$GYM.service
+[Unit]
+Description=Steelix Region Agent (${UPPER})
+After=steelix-brain.service
+Requires=steelix-brain.service
+[Service]
+ExecStart=/usr/bin/python3 -u /opt/Steelix_Fusion/agent/core.py
+Environment=REGION_ID=REGION_${UPPER}
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=append:/var/log/steelix/${GYM}.log
+StandardError=append:/var/log/steelix/${GYM}.log
+[Install]
+WantedBy=multi-user.target
+SVC
+done
+
+# ============================================================
+# PHASE 8: DAILY REPORTING SUBSYSTEM (NEW)
+# ============================================================
+echo -e "\n>>> PHASE 8: SILPH CO. DAILY REPORTER"
+
+cat << 'PY_REPORT' > "$INSTALL_DIR/reporter/summary.py"
+import pymysql, datetime, sys
+
+sys.path.append("/opt/Steelix_Fusion/pokegear")
+import phone
+
+def get_db_config():
+    cfg = {}
+    try:
+        with open("/etc/steelix.env") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                cfg[k] = v
+    except Exception as e:
+        sys.exit(1)
+    return {
+        'host':     cfg.get('STEELIX_DB_HOST', 'localhost'),
+        'user':     cfg.get('STEELIX_DB_USER'),
+        'password': cfg.get('STEELIX_DB_PASS'),
+        'database': cfg.get('STEELIX_DB_NAME'),
+    }
+
+def generate_summary():
+    db = get_db_config()
+    try:
+        conn = pymysql.connect(**db)
+        with conn.cursor() as c:
+            # Aggregate events over the last 24 hours
+            c.execute("""
+                SELECT event_type, COUNT(*) FROM system_logs 
+                WHERE timestamp >= NOW() - INTERVAL 1 DAY 
+                GROUP BY event_type
+            """)
+            stats = c.fetchall()
+
+            # Retrieve distinct anomalies
+            c.execute("""
+                SELECT node_id, metric_signature FROM system_logs 
+                WHERE event_type = 'HEARTBEAT_ANOMALY' 
+                AND timestamp >= NOW() - INTERVAL 1 DAY
+            """)
+            anomalies = c.fetchall()
+
+            # Identify critical honeypot hits
+            c.execute("""
+                SELECT raw_payload FROM system_logs 
+                WHERE event_type = 'EVENT' 
+                AND raw_payload LIKE '%CRITICAL%'
+                AND timestamp >= NOW() - INTERVAL 1 DAY
+            """)
+            criticals = c.fetchall()
+            
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        return
+    finally:
+        conn.close()
+
+    total_events = sum([row[1] for row in stats]) if stats else 0
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    report = f"==================================================\n"
+    report += f"   SILPH CO. SYSTEM BRIEFING ({now})\n"
+    report += f"==================================================\n"
+    report += f"Total Activity Logged (24h): {total_events}\n\n"
+    
+    report += "EVENT BREAKDOWN:\n"
+    if stats:
+        for row in stats:
+            report += f"  - {row[0]:<20}: {row[1]}\n"
+    else:
+        report += "  - No events recorded.\n"
+        
+    report += f"\nANOMALIES DETECTED: {len(anomalies)}\n"
+    for a in anomalies:
+        report += f"  > [{a[0]}] {a[1]}\n"
+
+    report += f"\nCRITICAL INCIDENTS (RED GYARADOS): {len(criticals)}\n"
+    for c in criticals:
+        report += f"  ! {c[0]}\n"
+        
+    report += "==================================================\n"
+
+    # Save to disk overwriting previous daily summary
+    with open("/var/log/steelix/daily_summary.txt", "w") as f:
+        f.write(report)
+
+    # Ping the pokegear logging subsystem
+    phone.make_call("REPORTER", f"Daily Summary Generated. Events: {total_events}. Anomalies: {len(anomalies)}", "INFO")
+    print("Daily report successfully generated.")
+
+if __name__ == '__main__':
+    generate_summary()
+PY_REPORT
+
+# Systemd Service to run the script
+cat << SVC > /etc/systemd/system/steelix-reporter.service
+[Unit]
+Description=Steelix Daily Log Reporter
+After=mariadb.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/Steelix_Fusion/reporter/summary.py
+User=root
+SVC
+
+# Systemd Timer to trigger it at midnight
+cat << TIMER > /etc/systemd/system/steelix-reporter.timer
+[Unit]
+Description=Run Steelix Daily Log Reporter at midnight
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+# ============================================================
+# PHASE 9: CLI DASHBOARD & EXECUTION
+# ============================================================
+echo -e "\n>>> PHASE 9: CLI DASHBOARD"
+
+cat << 'CLI_TOOL' > /usr/local/bin/steelix
+#!/usr/bin/env python3
+import sys, socket, json, os
+
+G, Y, R, X, C = "\033[96m", "\033[93m", "\033[91m", "\033[0m", "\033[94m"
+BRAIN_ADMIN_PORT = 3003
+INGEST_PORT      = 3001
+ALLOWED_CMDS     = {"STANDBY", "SILENCE", "ALERT", "RESET"}
+
+def send_raw(port, payload_bytes, recv=False):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(('127.0.0.1', port))
+        s.sendall(payload_bytes)
+        data = s.recv(4096) if recv else b""
+        s.close()
+        return data
+    except Exception as e:
+        print(f"{R}[!] Connection error: {e}{X}")
+        return None
+
+def status():
+    data = send_raw(BRAIN_ADMIN_PORT, b"STATUS", recv=True)
+    if not data:
+        print(f"{R}[!] DISCONNECTED (is steelix-brain running?){X}")
+        return
+
+    try:
+        d = json.loads(data.decode())
+    except json.JSONDecodeError:
+        print(f"{R}[!] Bad response from brain.{X}")
+        return
+
+    th = d.get("threat_level", "UNKNOWN")
+    bc = d.get("broadcast", "STANDBY")
+    c  = R if th == "RED" else (Y if th == "YELLOW" else G)
+
+    print(f"\n\033[1mSTEELIX FUSION (GEN II){X}")
+    print("=" * 60)
+    print(f" GLOBAL STATE:  {c}{th}{X}")
+    print(f" RADIO TOWER:   {R if bc != 'STANDBY' else G}{bc}{X}")
+    print("=" * 60)
+
+    log_path = "/opt/Steelix_Fusion/pokegear/call_history.log"
+    try:
+        with open(log_path) as f:
+            for line in f.readlines()[-2:]:
+                print(f" \033[90m> {line.strip()}{X}")
+    except FileNotFoundError:
+        pass
+
+    print("=" * 60)
+    nodes = d.get("nodes_detail", {})
+    if not nodes:
+        print(f" {R}NO ACTIVE REGIONS{X}")
+    else:
+        print(f"{'BADGE':<15} {'STATUS':<12} SIGNATURE")
+        print("-" * 60)
+        badges = ["BOULDER","CASCADE","THUNDER","RAINBOW","SOUL","MARSH","VOLCANO","EARTH"]
+        for b in badges:
+            key = f"REGION_{b}"
+            if key in nodes:
+                tel = nodes[key].get('telemetry', {})
+                sig = tel.get('signature', '-')
+                sta = tel.get('status', '?')
+                col = R if sta == "ANOMALY" else G
+                print(f"{G}{b:<15}{X} {col}{sta:<12}{X} {sig}")
+    print()
+
+def broadcast(cmd):
+    cmd = cmd.upper().strip()
+    if cmd not in ALLOWED_CMDS:
+        print(f"{R}[!] Unknown command '{cmd}'. Allowed: {ALLOWED_CMDS}{X}")
+        return
+    payload = json.dumps({"event": f"BROADCAST:{cmd}"}).encode()
+    send_raw(INGEST_PORT, payload)
+    print(f"{G}[*] Order '{cmd}' sent.{X}")
+
+def show_report():
+    try:
+        with open("/var/log/steelix/daily_summary.txt", "r") as f:
+            print(f.read())
+    except FileNotFoundError:
+        print(f"{R}[!] No daily report found. The reporter runs at midnight.{X}")
+        print(f"{Y}[*] You can trigger it manually with: systemctl start steelix-reporter.service{X}")
+
+def usage():
+    print(f"""
+{G}steelix{X} — Steelix Fusion CLI
+
+  {C}steelix{X}                  Show system status
+  {C}steelix broadcast <CMD>{X}  Send order to all agents
+                           Commands: {', '.join(sorted(ALLOWED_CMDS))}
+  {C}steelix train{X}            Train the AI anomaly model
+  {C}steelix logs <region>{X}    Tail the log for a region
+  {C}steelix report{X}          View the latest 24h system summary
+""")
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        status()
+    elif sys.argv[1] == "broadcast" and len(sys.argv) > 2:
+        broadcast(sys.argv[2])
+    elif sys.argv[1] == "train":
+        os.execv("/usr/local/bin/steelix-train", ["/usr/local/bin/steelix-train"])
+    elif sys.argv[1] == "logs" and len(sys.argv) > 2:
+        region = sys.argv[2].lower()
+        log = f"/var/log/steelix/{region}.log"
+        os.execv("/usr/bin/tail", ["/usr/bin/tail", "-f", log])
+    elif sys.argv[1] == "report":
+        show_report()
+    else:
+        usage()
+CLI_TOOL
+chmod +x /usr/local/bin/steelix
+
+# Final Service Enable & Start
+echo "[*] Reloading systemd daemon..."
+systemctl daemon-reload
+
+echo "[*] Enabling all services..."
+systemctl enable steelix-brain steelix-gyarados steelix-reporter.timer
+for GYM in "${GYMS[@]}"; do
+    systemctl enable steelix-region-$GYM
+done
+
+echo "[*] Starting brain first..."
+systemctl start steelix-brain
+wait_for_port 3001 "brain/ingest" || { echo "[!] Brain failed to come up."; exit 1; }
+wait_for_port 3004 "brain/pulse"  || { echo "[!] Brain pulse port failed."; exit 1; }
+
+echo "[*] Starting gyarados and reporter timer..."
+systemctl start steelix-gyarados
+systemctl start steelix-reporter.timer
+
+echo "[*] Starting region agents..."
+for GYM in "${GYMS[@]}"; do
+    systemctl start steelix-region-$GYM
+done
+
+# ============================================================
+# DONE
+# ============================================================
+echo -e "\n=================================================="
+echo "   STEELIX GRAND UNIFICATION DEPLOYED (v2.1)"
+echo ""
+echo "   DB credentials stored in: /etc/steelix.env"
+echo "   Logs:                      /var/log/steelix/"
+echo "   Run 'steelix' to check status"
+echo "   Run 'steelix report' to view daily summary"
+echo "   Run 'steelix-train' after data accumulates"
+echo "=================================================="
